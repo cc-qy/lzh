@@ -17,13 +17,14 @@ import logging
 
 from tqdm import tqdm 
 from models import PointConvSceneFlowPWC8192selfglobalPointConv as PointConvSceneFlow
-from models import multiScaleLoss
+from models import multiScaleLoss, multiScaleLoss_pose
 from pathlib import Path
 from collections import defaultdict
 
 import transforms
 import datasets
 import cmd_args 
+from utils import utils
 from main_utils import *
 
 def main():
@@ -34,10 +35,10 @@ def main():
     global args 
     args = cmd_args.parse_args_from_yaml(sys.argv[1])
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu if args.multi_gpu is None else '0'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu if args.multi_gpu is None else '1'
 
     '''CREATE DIR'''
-    experiment_dir = Path('../model-0613/')
+    experiment_dir = Path('../model-pose/')
     experiment_dir.mkdir(exist_ok=True)
     file_dir = Path(str(experiment_dir) + '/PointConv%sKITTI-'%args.model_name + str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M')))
     file_dir.mkdir(exist_ok=True)
@@ -163,16 +164,58 @@ def main():
             flow = flow.cuda() 
 
             model = model.train() 
-            pred_flows, fps_pc1_idxs, _, _, _ = model(pos1, pos2, norm1, norm2)
+            pred_flows, pred_poses_r,pred_poses_t,fps_pc1_idxs, _, _, _ = model(pos1, pos2, norm1, norm2)
 
             loss = multiScaleLoss(pred_flows, flow[:,:,0:3], fps_pc1_idxs)
+            loss_pose_r = multiScaleLoss_pose(pred_poses_r, flow[:,:,7:10], fps_pc1_idxs)
+            loss_pose_t = multiScaleLoss_pose(pred_poses_t, flow[:,:,10:13], fps_pc1_idxs)
+            
+            # print ("loss:",(loss.cpu().detach().numpy()).round(2),"loss_pose_r:",
+            #     (loss_pose_r.cpu().detach().numpy()).round(2),"loss_pose_r:",(loss_pose_t.cpu().detach().numpy()).round(2)
+            #     ,"loss_real_rt:",(1 * (20*loss_pose_r + loss_pose_t).cpu().detach().numpy()).round(2))
+
+            epe3d = torch.norm(pred_flows[0].permute(0, 2, 1) - flow[:,:,0:3], dim = 2).mean()
+            # print (loss_pose_r[0].shape)
+            # ori_mat_multi, pose_mat_multi = utils.euler2mat((pose_eur))
+            B,_,N = pred_poses_r[0].shape
+            pose_eur = torch.cat((pred_poses_r[0],pred_poses_t[0]),1).permute(0, 2, 1)
+            pose_eur = pose_eur.reshape(B*N,6)
+            # pose_eur = flow[:,:,7:13].reshape(8192,6)
+            # flow[:,:,7:13]
+            # print (flow[:,:,7:13].shape)
+
+            ori_mat_multi, pose_mat_multi = utils.euler2mat((pose_eur.cpu().detach().numpy()))
+            # print (pose_eur.shape)flow[:,:,0:3]
+            pos1 = pos1.reshape(B*N,3).cpu().detach().numpy()
+            one = np.expand_dims(np.ones_like(pos1[:,0]), 1)
+            Nor_points = np.hstack((pos1[:, 0:3], one))
+            # xxx
+            pc1_init_tran = torch.matmul(pose_mat_multi, torch.from_numpy(np.expand_dims(np.float64(Nor_points), axis = -1)))
+            flow_p = pc1_init_tran[:,:,0] - Nor_points
+            flow_p = flow_p[:,0:3].reshape(B,N,3)
+            epe3d_p = torch.norm(flow_p.cuda() - flow[:,:,0:3], dim = 2).mean()
+            # print (flow_p.shape)
+            # xxx
+            # epe3d = torch.norm(flow_p - flow[:,:,0:3], dim = 2).mean()
+            # print (pc1_init_tran.shape)
+            # xxx
+            # sf_init = pc1_init_tran[:,0:3,0] - pc1_init[:,0:3]
+            # # # error = sf[:,0:3] - sf_init.numpy()
+            # ori_mat_multi, pose_mat_multi = euler2mat((pose_eur))
+            # epe_r = torch.norm(loss_pose_r[0].permute(0, 2, 1) - flow[:,:,0:3], dim = 2).mean()
+            # epe_t = torch.norm(loss_pose_t[0].permute(0, 2, 1) - flow[:,:,0:3], dim = 2).mean()
+            if i%100 == 0:
+                print ("loss:",(loss.cpu().detach().numpy()).round(2),"loss_pose_r:",
+                    (loss_pose_r.cpu().detach().numpy()).round(2),"loss_pose_r:",(loss_pose_t.cpu().detach().numpy()).round(2)
+                    ,"loss_real_rt:",(1 * (20*loss_pose_r + loss_pose_t).cpu().detach().numpy()).round(2))
+                print ("error:",(epe3d.cpu().detach().numpy()).round(2),"error_p:",(epe3d_p.cpu().detach().numpy()).round(2))
 
             history['loss'].append(loss.cpu().data.numpy())
-            loss.backward()
+            (loss + 1 * (20*loss_pose_r + loss_pose_t)).backward()
             optimizer.step() 
             optimizer.zero_grad()
 
-            total_loss += loss.cpu().data * args.batch_size
+            total_loss += (loss.cpu().data ) * args.batch_size
             total_seen += args.batch_size
 
         scheduler.step()
@@ -182,8 +225,8 @@ def main():
         print(str_out)
         logger.info(str_out)
 
-        eval_epe3d, eval_loss = eval_sceneflow(model.eval(), val_loader)
-        str_out = 'EPOCH %d %s mean epe3d: %f  mean eval loss: %f'%(epoch, blue('eval'), eval_epe3d, eval_loss)
+        eval_epe3d, eval_epe3d_p, eval_loss = eval_sceneflow(model.eval(), val_loader)
+        str_out = 'EPOCH %d %s mean epe3d: %f mean epe3d_p: %f mean eval loss: %f'%(epoch, blue('eval'), eval_epe3d, eval_epe3d_p, eval_loss)
         print(str_out)
         logger.info(str_out)
 
@@ -213,19 +256,34 @@ def eval_sceneflow(model, loader):
         flow = flow.cuda() 
 
         with torch.no_grad():
-            pred_flows, fps_pc1_idxs, _, _, _ = model(pos1, pos2, norm1, norm2)
+            pred_flows, pred_poses_r,pred_poses_t,fps_pc1_idxs, _, _, _ = model(pos1, pos2, norm1, norm2)
 
             eval_loss = multiScaleLoss(pred_flows, flow[:,:,0:3], fps_pc1_idxs)
 
             epe3d = torch.norm(pred_flows[0].permute(0, 2, 1) - flow[:,:,0:3], dim = 2).mean()
 
+            B,_,N = pred_poses_r[0].shape
+            pose_eur = torch.cat((pred_poses_r[0],pred_poses_t[0]),1).permute(0, 2, 1)
+            pose_eur = pose_eur.reshape(B*N,6)
+
+            ori_mat_multi, pose_mat_multi = utils.euler2mat((pose_eur.cpu().detach().numpy()))
+            pos1 = pos1.reshape(B*N,3).cpu().detach().numpy()
+            one = np.expand_dims(np.ones_like(pos1[:,0]), 1)
+            Nor_points = np.hstack((pos1[:, 0:3], one))
+            pc1_init_tran = torch.matmul(pose_mat_multi, torch.from_numpy(np.expand_dims(np.float64(Nor_points), axis = -1)))
+            flow_p = pc1_init_tran[:,:,0] - Nor_points
+            flow_p = flow_p[:,0:3].reshape(B,N,3)
+            epe3d_p = torch.norm(flow_p.cuda() - flow[:,:,0:3], dim = 2).mean()
+
         metrics['epe3d_loss'].append(epe3d.cpu().data.numpy())
+        metrics['epe3d_p_loss'].append(epe3d_p.cpu().data.numpy())
         metrics['eval_loss'].append(eval_loss.cpu().data.numpy())
 
     mean_epe3d = np.mean(metrics['epe3d_loss'])
+    mean_epe3d_p = np.mean(metrics['epe3d_p_loss'])
     mean_eval = np.mean(metrics['eval_loss'])
 
-    return mean_epe3d, mean_eval
+    return mean_epe3d, mean_epe3d_p, mean_eval
 
 if __name__ == '__main__':
     main()
